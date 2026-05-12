@@ -7,8 +7,9 @@ Log Analytics カスタムテーブル (NotionAuditLog_CL) に送信する。
 環境変数:
   NOTION_API_BASE_URL       — Notion API ベース URL（本番: https://api.notion.com、モック: http://localhost:5000）
   NOTION_API_VERSION        — Notion API バージョン（デフォルト: 2022-06-28）
-  KEY_VAULT_URL             — Key Vault URL（例: https://myvault.vault.azure.net）
-  NOTION_TOKEN_SECRET_NAME  — Key Vault 内のシークレット名（デフォルト: NotionIntegrationToken）
+  NOTION_TOKEN_DIRECT       — Notion Integration Token（App Settings に直接格納、推奨）
+  KEY_VAULT_URL             — Key Vault URL（後方互換用。未設定時は NOTION_TOKEN_DIRECT を使用）
+  NOTION_TOKEN_SECRET_NAME  — Key Vault 内のシークレット名（KEY_VAULT_URL 設定時のみ使用）
   DCE_ENDPOINT              — Data Collection Endpoint URL
   DCR_IMMUTABLE_ID          — Data Collection Rule の Immutable ID
   DCR_STREAM_NAME           — DCR ストリーム名（デフォルト: Custom-NotionAuditLog_CL）
@@ -79,9 +80,13 @@ class StateManager:
 
 
 def _get_notion_token(credential: DefaultAzureCredential) -> str:
-    """Retrieve Notion Integration Token from Key Vault."""
+    """Retrieve Notion Integration Token.
+
+    優先順位:
+      1. NOTION_TOKEN_DIRECT 環境変数（App Settings 直接格納、v4 デフォルト）
+      2. KEY_VAULT_URL が設定されている場合は Key Vault から取得（後方互換）
+    """
     if not KEY_VAULT_URL:
-        # Fallback: direct env var for local/mock testing
         token = os.environ.get("NOTION_TOKEN_DIRECT", "")
         if token:
             return token

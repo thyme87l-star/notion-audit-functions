@@ -6,14 +6,12 @@ Notion の [Audit Log API](https://developers.notion.com/reference/get-audit-log
 
 ```mermaid
 flowchart LR
-    KV["Key Vault<br/>Notion Token"]
     BS["Blob Storage<br/>State管理"]
     N["Notion API<br/>(Enterprise Plan)"]
     F["Azure Functions (Python 3.11)<br/>Timer: 5min | MSI 認証"]
     DCE["DCE / DCR"]
     T[("NotionAuditLog_CL<br/>Microsoft Sentinel")]
 
-    KV -. "Token取得" .-> F
     BS <-. "State読込/更新" .-> F
     F -->|"GET /v1/audit_log<br/>差分取得"| N
     N -->|"JSON Response"| F
@@ -26,11 +24,11 @@ flowchart LR
 | 特徴 | 詳細 |
 |---|---|
 | **差分取得** | Blob Storage に前回ポーリング時刻を保持し、`start_date` パラメータで差分のみ取得 |
-| **Key Vault 統合** | Notion Token は Key Vault に安全に格納。MSI (`DefaultAzureCredential`) で自動取得 |
+| **App Settings 直接格納** | Notion Token は `@secure()` Bicep パラメータ経由で App Settings に安全に格納。Key Vault 不要 |
 | **Identity-based Storage** | Blob Storage は MSI + RBAC。Shared Key 不使用でポリシー準拠 |
 | **SDK バッチ送信** | `LogsIngestionClient` による自動バッチング (max 1MB/req) とリトライ |
 | **レートリミット対応** | 429 時の指数バックオフ |
-| **低コスト** | Consumption Y1 プランで月額 **$3〜$12** |
+| **低コスト** | Consumption Y1 プランで月額 **$3〜$10** |
 
 ## 前提条件
 
@@ -51,7 +49,7 @@ flowchart LR
 ```
 ├── params.json                          # パラメータテンプレート（最初にこれを編集）
 ├── deploy.ps1                           # ワンクリック展開スクリプト
-├── ISS-046_deploy.bicep                 # インフラ一括デプロイ（Func + Storage + AI + KV + DCE/DCR + RBAC）
+├── ISS-046_deploy.bicep                 # インフラ一括デプロイ（Func + Storage + AI + DCE/DCR + RBAC）
 ├── ISS-046_build_and_deploy.py          # 方法 B 用 zip ビルド & デプロイ自動化
 └── ISS-046_function_app/
     ├── function_app.py                  # Timer Trigger: Notion API → スキーマ変換 → Logs Ingestion API
@@ -69,12 +67,12 @@ Bicep により以下のリソースが一括デプロイされます。
 | 2 | App Service Plan (Dynamic Y1) | `{baseName}-plan-{suffix}` | Consumption 課金プラン |
 | 3 | Storage Account | `st{baseName}{suffix}` | Functions バックエンド + State Blob |
 | 4 | Application Insights | `{baseName}-ai-{suffix}` | 実行ログ・メトリクス監視 |
-| 5 | Key Vault | `kv-{baseName}-{suffix}` | Notion Token 格納 |
-| 6 | DCE | `{baseName}-dce-{suffix}` | ログ受信エンドポイント |
-| 7 | DCR | `{baseName}-dcr-{suffix}` | スキーマ定義・ルーティング |
+| 5 | DCE | `{baseName}-dce-{suffix}` | ログ受信エンドポイント |
+| 6 | DCR | `{baseName}-dcr-{suffix}` | スキーマ定義・ルーティング |
+
+> **Notion Token**: `@secure()` Bicep パラメータとして渡され、Function App の App Settings (`NOTION_TOKEN_DIRECT`) に直接格納されます。Key Vault は使用しません。
 
 RBAC は Bicep 内で自動割り当て:
-- **Key Vault Secrets User** → Function App MSI
 - **Storage Blob Data Contributor** → Function App MSI
 - **Monitoring Metrics Publisher** → Function App MSI (DCR スコープ)
 
@@ -120,10 +118,9 @@ az account set --subscription "<SUB_ID>"
 |---|---|
 | 0 | Azure CLI ログイン確認 |
 | 1 | リソースグループ作成 |
-| 2 | Bicep デプロイ (全インフラ) |
-| 3 | Notion Token → Key Vault 格納 |
-| 4 | Function App コードデプロイ |
-| 5 | 動作確認 |
+| 2 | Bicep デプロイ (全インフラ + Notion Token を App Settings に格納) |
+| 3 | Function App コードデプロイ |
+| 4 | 動作確認 |
 
 > `deploy.ps1` はデプロイ後に Storage Account の `allowSharedKeyAccess` プロパティを自動検出し、`false` の場合は方法 A (`func publish`) → 方法 B (Blob パッケージデプロイ) に自動切替します。
 
@@ -149,17 +146,12 @@ az group create --name Notion-Audit-Func-RG --location japaneast
 az deployment group create `
   --resource-group Notion-Audit-Func-RG `
   --template-file ISS-046_deploy.bicep `
-  --parameters sentinelWorkspaceResourceId="<WORKSPACE_RESOURCE_ID>"
+  --parameters `
+    sentinelWorkspaceResourceId="<WORKSPACE_RESOURCE_ID>" `
+    notionToken="<NOTION_INTEGRATION_TOKEN>"
 ```
 
-### Key Vault に Token を格納
-
-```powershell
-az keyvault secret set `
-  --vault-name <KEY_VAULT_NAME> `
-  --name NotionIntegrationToken `
-  --value "<NOTION_INTEGRATION_TOKEN>"
-```
+> `notionToken` は `@secure()` パラメータです。Bicep が Function App の App Settings (`NOTION_TOKEN_DIRECT`) に直接格納します。
 
 ### コードデプロイ — 方法 A (標準環境)
 
@@ -212,8 +204,7 @@ NotionAuditLog_CL
 | `func publish` が 403 | `allowSharedKeyAccess: false` ポリシー | 方法 B (Blob デプロイ) を使用 |
 | 関数が 0 件 | `EnableWorkerIndexing` 未設定 | App Settings で `AzureWebJobsFeatureFlags=EnableWorkerIndexing` を確認 |
 | 関数が起動するが import エラー | zip に Windows バイナリ (.pyd) が混入 | `--platform manylinux2014_x86_64` で zip を再作成 |
-| Key Vault エラー | MSI に KV Secrets User なし | RBAC 割り当てを確認 |
-| Notion API 401 | Token 無効/期限切れ | KV から Token 取得して直接テスト |
+| Notion API 401 | Token 無効/期限切れ | Azure Portal → Function App → 構成 → `NOTION_TOKEN_DIRECT` を確認・更新 |
 | Notion API 403 | Enterprise プラン以外 | Notion 管理画面でプラン確認 |
 | データが来ない | DCR RBAC 不足 or インジェスト遅延 | Monitoring Metrics Publisher RBAC を確認。5〜10 分待つ |
 
@@ -223,10 +214,9 @@ NotionAuditLog_CL
 |---|---|---|
 | Function App | Consumption Y1 | $0〜$5 |
 | Storage Account | Standard LRS | $1〜$2 |
-| Key Vault | Standard | ~$0.03 |
 | Application Insights | 従量課金 | $2〜$5 |
 | DCE / DCR | — | 無料 |
-| **合計** | | **$3〜$12/月** |
+| **合計** | | **$3〜$10/月** |
 
 > Log Analytics へのデータインジェスト課金 ($2.76/GB) は含まれていません。Notion Audit Log は軽量 (1件 ~500B) のため、月10万件でも ~50MB (~$0.14) 程度です。
 
