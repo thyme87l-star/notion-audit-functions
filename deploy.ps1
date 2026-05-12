@@ -1,15 +1,14 @@
 ﻿<#
 .SYNOPSIS
-    ISS-046 Notion Audit Log → Sentinel: Azure Functions 自動展開スクリプト
+    ISS-046 Notion Audit Log → Sentinel: Azure Functions 自動展開スクリプト (v4)
 
 .DESCRIPTION
     params.json に記入されたパラメータを読み取り、以下を自動実行します:
       Step 0: Azure CLI ログイン・権限確認
       Step 1: リソースグループの作成
-      Step 2: Bicep でインフラを一括デプロイ
-      Step 3: Notion Integration Token を Key Vault に格納
-      Step 4: Function App コードのデプロイ（方法 A or B を自動選択）
-      Step 5: 動作確認（手動トリガー + KQL データ到達チェック）
+      Step 2: Bicep でインフラを一括デプロイ（Notion Token は App Settings に直接格納）
+      Step 3: Function App コードのデプロイ（方法 A or B を自動選択）
+      Step 4: 動作確認（手動トリガー + KQL データ到達チェック）
 
 .PARAMETER ParamsFile
     パラメータファイルのパス（デフォルト: 同フォルダの params.json）
@@ -238,6 +237,7 @@ $deployOutput = az deployment group create `
         sentinelWorkspaceResourceId=$workspaceResId `
         baseName=$baseName `
         pollingIntervalMinutes=$pollingInterval `
+        notionToken=$notionToken `
     --query properties.outputs -o json 2>&1
 
 if ($LASTEXITCODE -ne 0) {
@@ -248,46 +248,22 @@ if ($LASTEXITCODE -ne 0) {
 
 $outputs = $deployOutput | ConvertFrom-Json
 $functionAppName    = $outputs.functionAppName.value
-$keyVaultName       = $outputs.keyVaultName.value
 $storageAccountName = $outputs.storageAccountName.value
 $dceEndpoint        = $outputs.dceEndpoint.value
 $dcrImmutableId     = $outputs.dcrImmutableId.value
 
 Write-Check "デプロイ完了"
 Write-Host "  Function App  : $functionAppName"
-Write-Host "  Key Vault     : $keyVaultName"
 Write-Host "  Storage       : $storageAccountName"
 Write-Host "  DCE Endpoint  : $dceEndpoint"
 Write-Host "  DCR ID        : $dcrImmutableId"
+Write-Host ""
+Write-Host "  ※ Notion Token は App Settings (NOTION_TOKEN_DIRECT) に直接格納されました" -ForegroundColor Gray
 
 # ============================================================
-# Step 3: Notion Integration Token を Key Vault に格納
+# Step 3: Function App コードのデプロイ
 # ============================================================
-Write-Step "3" "Notion Integration Token を Key Vault に格納"
-
-Write-Host "  Key Vault '$keyVaultName' に Token を格納します..."
-az keyvault secret set `
-    --vault-name $keyVaultName `
-    --name NotionIntegrationToken `
-    --value $notionToken `
-    -o none 2>&1
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Fail "Key Vault への Token 格納に失敗しました"
-    Write-Host "  Key Vault のアクセスポリシーまたは RBAC を確認してください。"
-    exit 1
-}
-
-$secretEnabled = az keyvault secret show `
-    --vault-name $keyVaultName `
-    --name NotionIntegrationToken `
-    --query attributes.enabled -o tsv
-Write-Check "Token 格納完了 (enabled: $secretEnabled)"
-
-# ============================================================
-# Step 4: Function App コードのデプロイ
-# ============================================================
-Write-Step "4" "Function App コードのデプロイ（方法 $deployMethod）"
+Write-Step "3" "Function App コードのデプロイ（方法 $deployMethod）"
 
 $funcAppDir = "$PSScriptRoot\ISS-046_function_app"
 if (-not (Test-Path $funcAppDir)) {
@@ -431,9 +407,9 @@ if ($funcList) {
 }
 
 # ============================================================
-# Step 5: 動作確認
+# Step 4: 動作確認
 # ============================================================
-Write-Step "5" "動作確認（手動トリガー）"
+Write-Step "4" "動作確認（手動トリガー）"
 
 Write-Host "  手動トリガーを実行します..."
 
@@ -475,11 +451,11 @@ Write-Host "=" * 60 -ForegroundColor Green
 Write-Host ""
 Write-Host "  リソースグループ  : $rgName"
 Write-Host "  Function App      : $functionAppName"
-Write-Host "  Key Vault         : $keyVaultName"
 Write-Host "  Storage Account   : $storageAccountName"
 Write-Host "  DCE Endpoint      : $dceEndpoint"
 Write-Host "  DCR Immutable ID  : $dcrImmutableId"
 Write-Host "  デプロイ方法      : $deployMethod"
+Write-Host "  Token 格納方式     : App Settings (NOTION_TOKEN_DIRECT)"
 Write-Host ""
 Write-Host "  データ確認 (KQL):" -ForegroundColor White
 Write-Host "    Defender ポータル → Advanced Hunting で以下を実行:"
