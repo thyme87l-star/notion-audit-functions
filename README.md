@@ -1,4 +1,4 @@
-﻿# Notion Audit Log → Microsoft Sentinel (Azure Functions)
+# Notion Audit Log → Microsoft Sentinel (Azure Functions)
 
 Notion の [Audit Log API](https://developers.notion.com/reference/get-audit-log) から監査ログを自動取得し、Microsoft Sentinel の `NotionAuditLog_CL` カスタムテーブルへインジェストする Azure Functions ソリューションです。
 
@@ -43,6 +43,10 @@ flowchart LR
 - Sentinel が有効化された Log Analytics ワークスペース
 - Azure CLI v2.60 以上
 - Python 3.11
+
+> **⚠ Azure Policy に関する注意**: 以下のポリシーが適用されている環境ではデプロイが失敗する場合があります。
+> - **Storage Account `publicNetworkAccess: Disabled` を強制するポリシー**: Bicep デプロイ時に Storage Account の作成が拒否されます。該当する場合は、`deploy.bicep` に `publicNetworkAccess: 'Enabled'` を追加するか、Private Endpoint の構成が必要です。
+> - **Storage Account llowSharedKeyAccess: false を強制するポリシー**: `AzureWebJobsStorage` 接続が Shared Key を使用するため、Function App が起動しません。`deploy.ps1` は自動検出して方法 B（Blob パッケージデプロイ）に切り替えますが、`AzureWebJobsStorage` 自体の接続方式は変更されません。対処法: [Identity-based connections](https://learn.microsoft.com/azure/azure-functions/functions-reference?tabs=blob#connecting-to-host-storage-with-an-identity) を構成するか、ポリシーの除外設定をリクエストしてください。
 
 ## ファイル構成
 
