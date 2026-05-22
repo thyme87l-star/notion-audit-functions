@@ -1,191 +1,200 @@
-﻿"""
-Notion Audit Build and Deploy Script
-Builds the Azure Functions deployment zip with correct structure for Linux Consumption.
-Packages dependencies flat at the root level (alongside function_app.py).
-Uses Python zipfile to ensure forward slashes in zip entries.
 """
+ISS-065-05: Blob Package Deploy Script
+========================================
+SharedKey 無効化環境向けの Function App デプロイスクリプト。
+zip パッケージを作成し、MI 認証で Blob にアップロード後、
+Function App の WEBSITE_RUN_FROM_PACKAGE を設定する。
+
+Usage:
+  python build_and_deploy.py \
+    --resource-group <RG> \
+    --function-app <FUNC_NAME> \
+    --storage-account <STORAGE_ACCOUNT>
+
+Prerequisites:
+  - az login 済み（デプロイ実行ユーザーが Storage Blob Data Contributor 以上）
+  - Python 3.11
+"""
+
+import argparse
 import os
-import sys
 import shutil
 import subprocess
-import zipfile
+import sys
 import tempfile
-
-FUNC_DIR = os.path.dirname(os.path.abspath(__file__))
-FUNC_APP_DIR = os.path.join(FUNC_DIR, "function_app")
-BUILD_DIR = os.path.join(tempfile.gettempdir(), "iss046_func_build_v3")
-ZIP_PATH = os.path.join(tempfile.gettempdir(), "iss046_release_v3.zip")
-
-STORAGE_ACCOUNT = "stnotionauditdrj4uph6"
-CONTAINER = "function-releases"
-BLOB_NAME = "release.zip"
-FUNC_NAME = "notion-audit-func-drj4uph6hbohg"
-RG = "Notion-Audit-RG"
+import zipfile
+from pathlib import Path
 
 
-def step_1_prepare_build():
-    """Clean and prepare build directory with function files."""
-    print("=== Step 1: Prepare build directory ===")
-    if os.path.exists(BUILD_DIR):
-        shutil.rmtree(BUILD_DIR)
-    os.makedirs(BUILD_DIR)
-
-    for f in ["function_app.py", "host.json", "requirements.txt"]:
-        src = os.path.join(FUNC_APP_DIR, f)
-        dst = os.path.join(BUILD_DIR, f)
-        shutil.copy2(src, dst)
-        print(f"  Copied {f}")
-
-    print(f"  Build dir: {BUILD_DIR}")
+def run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    """Run a shell command and return the result."""
+    print(f"  > {' '.join(cmd)}")
+    # shell=True required on Windows where az is a .cmd file
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=check, shell=True
+    )
+    if result.returncode != 0 and not check:
+        print(f"  [WARN] Exit code {result.returncode}: {result.stderr.strip()}")
+    return result
 
 
-def step_2_install_deps():
-    """Install dependencies flat at the root level."""
-    print("\n=== Step 2: Install dependencies (flat at root) ===")
-    req_file = os.path.join(BUILD_DIR, "requirements.txt")
+def build_zip(function_app_dir: Path, output_path: Path) -> None:
+    """Build the deployment zip package.
 
-    with open(req_file) as f:
-        print(f"  Requirements:\n{f.read()}")
+    Uses a temp directory to avoid Windows MAX_PATH (260 char) issues
+    when the workspace path is deeply nested.
+    """
+    print("\n[1/4] Building zip package...")
 
-    # Install for Linux x86_64 Python 3.11
-    cmd = [
-        sys.executable, "-m", "pip", "install",
-        "--target", BUILD_DIR,
-        "--platform", "manylinux2014_x86_64",
-        "--python-version", "3.11",
-        "--only-binary=:all:",
-        "-r", req_file,
-        "--no-cache-dir",
-        "--quiet"
-    ]
-    print(f"  Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  WARNING: pip returned {result.returncode}")
-        print(f"  stderr: {result.stderr}")
-        # Try without platform constraints for pure-python packages
-        print("  Retrying without platform constraints...")
-        cmd2 = [
+    # Use short temp path to avoid MAX_PATH issues on Windows
+    with tempfile.TemporaryDirectory(prefix="func_build_") as tmp:
+        tmp_path = Path(tmp)
+        pkg_dir = tmp_path / "site-packages"
+        pkg_dir.mkdir()
+
+        requirements = function_app_dir / "requirements.txt"
+        # Install packages for the target platform (Linux Python 3.11)
+        # to ensure binary compatibility with Azure Functions runtime
+        run_cmd([
             sys.executable, "-m", "pip", "install",
-            "--target", BUILD_DIR,
-            "-r", req_file,
-            "--no-cache-dir",
-            "--quiet"
-        ]
-        result2 = subprocess.run(cmd2, capture_output=True, text=True)
-        if result2.returncode != 0:
-            print(f"  ERROR: pip failed: {result2.stderr}")
-            return False
-    
-    # Verify critical packages exist
-    critical = ["requests", "azure", "certifi", "urllib3", "charset_normalizer"]
-    for pkg in critical:
-        pkg_path = os.path.join(BUILD_DIR, pkg)
-        if os.path.isdir(pkg_path):
-            print(f"  OK: {pkg}/ exists")
-        else:
-            print(f"  MISSING: {pkg}/")
-    
-    return True
+            "-r", str(requirements),
+            "--target", str(pkg_dir),
+            "--implementation", "cp",
+            "--python-version", "3.11",
+            "--platform", "manylinux2014_x86_64",
+            "--only-binary=:all:",
+            "--upgrade", "-q",
+        ])
+
+        # Create zip
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Add function code files
+            for fname in ["function_app.py", "host.json", "requirements.txt"]:
+                fpath = function_app_dir / fname
+                if fpath.exists():
+                    zf.write(fpath, fname)
+
+            # Add installed packages under .python_packages/lib/site-packages/
+            # This is the path Azure Functions Python worker expects
+            pkg_prefix = ".python_packages/lib/site-packages"
+            for root, _dirs, files in os.walk(pkg_dir):
+                for fn in files:
+                    full_path = Path(root) / fn
+                    rel = full_path.relative_to(pkg_dir).as_posix()
+                    arc_name = f"{pkg_prefix}/{rel}"
+                    zf.write(full_path, arc_name)
+
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"  Created: {output_path} ({size_mb:.1f} MB)")
 
 
-def step_3_create_zip():
-    """Create zip with forward slashes (Linux-compatible)."""
-    print(f"\n=== Step 3: Create zip with forward slashes ===")
-    if os.path.exists(ZIP_PATH):
-        os.remove(ZIP_PATH)
+def upload_blob(storage_account: str, container: str, blob_name: str, file_path: Path) -> str:
+    """Upload zip to Blob Storage using Entra ID auth."""
+    print("\n[2/4] Uploading to Blob Storage (--auth-mode login)...")
 
-    file_count = 0
-    with zipfile.ZipFile(ZIP_PATH, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(BUILD_DIR):
-            # Skip __pycache__ and .dist-info directories
-            dirs[:] = [d for d in dirs if d != '__pycache__' and not d.endswith('.dist-info')]
-            for file in files:
-                if file.endswith('.pyc'):
-                    continue
-                full_path = os.path.join(root, file)
-                # Use forward slashes for zip entry name
-                arc_name = os.path.relpath(full_path, BUILD_DIR).replace('\\', '/')
-                zf.write(full_path, arc_name)
-                file_count += 1
-
-    size_mb = os.path.getsize(ZIP_PATH) / (1024 * 1024)
-    print(f"  Zip created: {ZIP_PATH}")
-    print(f"  Size: {size_mb:.2f} MB")
-    print(f"  Files: {file_count}")
-
-    # Verify key entries
-    with zipfile.ZipFile(ZIP_PATH, 'r') as zf:
-        entries = zf.namelist()
-        checks = [
-            "function_app.py",
-            "host.json",
-            "requests/__init__.py",
-            "azure/__init__.py",
-            "azure/functions/__init__.py",
-            "azure/identity/__init__.py",
-        ]
-        print("\n  Key entries check:")
-        for check in checks:
-            found = check in entries
-            print(f"    {'OK' if found else 'MISSING'}: {check}")
-        
-        # Show first 20 root-level entries
-        root_entries = sorted(set(e.split('/')[0] for e in entries))
-        print(f"\n  Root-level items ({len(root_entries)}):")
-        for e in root_entries[:25]:
-            print(f"    {e}")
-
-
-def step_4_upload():
-    """Upload zip to blob storage."""
-    print(f"\n=== Step 4: Upload to blob storage ===")
-    env = os.environ.copy()
-    env["AZURE_CONFIG_DIR"] = os.path.join(os.environ["USERPROFILE"], ".azure-iceteanow")
-    
-    cmd = [
-        "az", "storage", "blob", "upload",
-        "--account-name", STORAGE_ACCOUNT,
-        "--container-name", CONTAINER,
-        "--name", BLOB_NAME,
-        "--file", ZIP_PATH,
-        "--overwrite",
+    # Ensure container exists
+    run_cmd([
+        "az", "storage", "container", "create",
+        "--account-name", storage_account,
+        "--name", container,
         "--auth-mode", "login",
-        "-o", "none"
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env, shell=True)
-    if result.returncode != 0:
-        print(f"  ERROR: {result.stderr}")
-        return False
-    print("  Upload complete.")
-    return True
+    ], check=False)
+
+    # Upload blob
+    run_cmd([
+        "az", "storage", "blob", "upload",
+        "--account-name", storage_account,
+        "--container-name", container,
+        "--name", blob_name,
+        "--file", str(file_path),
+        "--auth-mode", "login",
+        "--overwrite",
+    ])
+
+    blob_url = f"https://{storage_account}.blob.core.windows.net/{container}/{blob_name}"
+    print(f"  Uploaded: {blob_url}")
+    return blob_url
 
 
-def step_5_restart():
-    """Restart Function App."""
-    print(f"\n=== Step 5: Restart Function App ===")
-    env = os.environ.copy()
-    env["AZURE_CONFIG_DIR"] = os.path.join(os.environ["USERPROFILE"], ".azure-iceteanow")
-    
-    cmd = [
+def configure_function_app(resource_group: str, function_app: str, blob_url: str) -> None:
+    """Set WEBSITE_RUN_FROM_PACKAGE to use MI-authenticated Blob."""
+    print("\n[3/4] Configuring Function App for Blob package deploy...")
+
+    run_cmd([
+        "az", "functionapp", "config", "appsettings", "set",
+        "--name", function_app,
+        "--resource-group", resource_group,
+        "--settings",
+        f"WEBSITE_RUN_FROM_PACKAGE={blob_url}",
+        "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID=SystemAssigned",
+    ])
+
+    print("  App Settings updated.")
+
+
+def restart_function_app(resource_group: str, function_app: str) -> None:
+    """Restart Function App to apply new package."""
+    print("\n[4/4] Restarting Function App...")
+
+    run_cmd([
         "az", "functionapp", "restart",
-        "--name", FUNC_NAME,
-        "--resource-group", RG,
-        "-o", "none"
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env, shell=True)
-    if result.returncode != 0:
-        print(f"  ERROR: {result.stderr}")
-        return False
-    print("  Restart complete.")
-    return True
+        "--name", function_app,
+        "--resource-group", resource_group,
+    ])
+
+    print("  Function App restarted. Deployment complete.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ISS-065-05 Blob Package Deploy")
+    parser.add_argument("--resource-group", "-g", required=True, help="Resource group name")
+    parser.add_argument("--function-app", "-f", required=True, help="Function App name")
+    parser.add_argument("--storage-account", "-s", required=True, help="Storage account name")
+    parser.add_argument("--container", default="function-releases", help="Blob container name")
+    parser.add_argument("--blob-name", default="release.zip", help="Blob name for the package")
+    parser.add_argument(
+        "--function-app-dir",
+        default=str(Path(__file__).parent / "function_app"),
+        help="Path to function_app/ directory",
+    )
+    args = parser.parse_args()
+
+    function_app_dir = Path(args.function_app_dir)
+    if not function_app_dir.exists():
+        print(f"ERROR: function_app directory not found: {function_app_dir}")
+        sys.exit(1)
+
+    output_zip = function_app_dir / "release.zip"
+
+    print("=" * 60)
+    print("ISS-065-05: Blob Package Deploy")
+    print("=" * 60)
+    print(f"  Resource Group:  {args.resource_group}")
+    print(f"  Function App:    {args.function_app}")
+    print(f"  Storage Account: {args.storage_account}")
+    print(f"  Container:       {args.container}")
+    print(f"  Source:          {function_app_dir}")
+
+    # Step 1: Build zip
+    build_zip(function_app_dir, output_zip)
+
+    # Step 2: Upload to Blob
+    blob_url = upload_blob(args.storage_account, args.container, args.blob_name, output_zip)
+
+    # Step 3: Configure Function App
+    configure_function_app(args.resource_group, args.function_app, blob_url)
+
+    # Step 4: Restart
+    restart_function_app(args.resource_group, args.function_app)
+
+    # Cleanup local zip
+    output_zip.unlink(missing_ok=True)
+
+    print("\n" + "=" * 60)
+    print("DONE. Verify with:")
+    print(f"  az functionapp show --name {args.function_app} --resource-group {args.resource_group} --query state")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    step_1_prepare_build()
-    if not step_2_install_deps():
-        sys.exit(1)
-    step_3_create_zip()
-    step_4_upload()
-    step_5_restart()
-    print("\n=== DONE. Wait 30s then check function discovery. ===")
+    main()

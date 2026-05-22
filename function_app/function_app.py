@@ -1,19 +1,25 @@
-﻿"""
+"""
 Notion Audit Log Connector — Azure Functions (Timer Trigger)
 =====================================================================
+ISS-065-05: セキュリティ設計適用版
+
 Notion Audit Log API からイベントを定期取得し、Logs Ingestion API 経由で
 Log Analytics カスタムテーブル (NotionAuditLog_CL) に送信する。
 
+セキュリティ設計:
+  - Token は Key Vault Reference により環境変数 NOTION_TOKEN に自動注入される
+    （コード内で Key Vault SDK を直接使用しない）
+  - Storage (State管理) は DefaultAzureCredential (System Assigned MI) で接続
+  - Logs Ingestion API も同様に MI 認証
+
 環境変数:
-  NOTION_API_BASE_URL       — Notion API ベース URL（本番: https://api.notion.com、モック: http://localhost:5000）
+  NOTION_TOKEN              — Notion Integration Token（Key Vault Reference で注入）
+  NOTION_API_BASE_URL       — Notion API ベース URL（デフォルト: https://api.notion.com）
   NOTION_API_VERSION        — Notion API バージョン（デフォルト: 2022-06-28）
-  NOTION_TOKEN_DIRECT       — Notion Integration Token（App Settings に直接格納、推奨）
-  KEY_VAULT_URL             — Key Vault URL（後方互換用。未設定時は NOTION_TOKEN_DIRECT を使用）
-  NOTION_TOKEN_SECRET_NAME  — Key Vault 内のシークレット名（KEY_VAULT_URL 設定時のみ使用）
   DCE_ENDPOINT              — Data Collection Endpoint URL
   DCR_IMMUTABLE_ID          — Data Collection Rule の Immutable ID
   DCR_STREAM_NAME           — DCR ストリーム名（デフォルト: Custom-NotionAuditLog_CL）
-  STATE_STORAGE_ACCOUNT_NAME — Blob Storage アカウント名（ステート管理用、MSI認証）
+  STATE_STORAGE_ACCOUNT_NAME — Blob Storage アカウント名（State管理用、MI認証）
   STATE_CONTAINER_NAME      — Blob コンテナ名（デフォルト: notion-connector-state）
   POLLING_INTERVAL_MINUTES  — ポーリング間隔（デフォルト: 5）
 """
@@ -27,7 +33,6 @@ from datetime import datetime, timezone
 import azure.functions as func
 import requests
 from azure.identity import DefaultAzureCredential
-from azure.keyvault.secrets import SecretClient
 from azure.monitor.ingestion import LogsIngestionClient
 from azure.storage.blob import BlobServiceClient
 
@@ -36,8 +41,6 @@ app = func.FunctionApp()
 # --- Configuration ---
 NOTION_API_BASE_URL = os.environ.get("NOTION_API_BASE_URL", "https://api.notion.com")
 NOTION_API_VERSION = os.environ.get("NOTION_API_VERSION", "2022-06-28")
-KEY_VAULT_URL = os.environ.get("KEY_VAULT_URL", "")
-NOTION_TOKEN_SECRET_NAME = os.environ.get("NOTION_TOKEN_SECRET_NAME", "NotionIntegrationToken")
 DCE_ENDPOINT = os.environ.get("DCE_ENDPOINT", "")
 DCR_IMMUTABLE_ID = os.environ.get("DCR_IMMUTABLE_ID", "")
 DCR_STREAM_NAME = os.environ.get("DCR_STREAM_NAME", "Custom-NotionAuditLog_CL")
@@ -50,7 +53,7 @@ MAX_RETRIES = 3
 
 
 class StateManager:
-    """Manages last poll timestamp in Azure Blob Storage (MSI auth)."""
+    """Manages last poll timestamp in Azure Blob Storage (MI auth)."""
 
     def __init__(self, account_name: str, container_name: str, blob_name: str, credential):
         account_url = f"https://{account_name}.blob.core.windows.net"
@@ -79,22 +82,24 @@ class StateManager:
         )
 
 
-def _get_notion_token(credential: DefaultAzureCredential) -> str:
-    """Retrieve Notion Integration Token.
+def _get_notion_token() -> str:
+    """Get Notion Integration Token from environment variable.
 
-    優先順位:
-      1. NOTION_TOKEN_DIRECT 環境変数（App Settings 直接格納、v4 デフォルト）
-      2. KEY_VAULT_URL が設定されている場合は Key Vault から取得（後方互換）
+    Key Vault Reference により Function App 起動時に自動注入されるため、
+    コード内で Key Vault SDK を使う必要はない。
     """
-    if not KEY_VAULT_URL:
-        token = os.environ.get("NOTION_TOKEN_DIRECT", "")
-        if token:
-            return token
-        raise ValueError("KEY_VAULT_URL is not set and NOTION_TOKEN_DIRECT is empty")
-
-    secret_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
-    secret = secret_client.get_secret(NOTION_TOKEN_SECRET_NAME)
-    return secret.value
+    token = os.environ.get("NOTION_TOKEN", "")
+    if not token:
+        raise ValueError(
+            "NOTION_TOKEN is not set. Ensure Key Vault Reference is configured correctly."
+        )
+    # Key Vault Reference が未解決の場合、値が @Microsoft.KeyVault(...) のまま残る
+    if token.startswith("@Microsoft.KeyVault("):
+        raise ValueError(
+            "NOTION_TOKEN contains unresolved Key Vault Reference. "
+            "Check: 1) Key Vault Secrets User RBAC, 2) Secret exists, 3) KV FW allows AzureServices."
+        )
+    return token
 
 
 def _fetch_audit_logs(token: str, start_timestamp: str | None = None) -> list[dict]:
@@ -128,7 +133,8 @@ def _fetch_audit_logs(token: str, start_timestamp: str | None = None) -> list[di
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", "2"))
                     logging.warning(
-                        f"Rate limited (429). Retry-After: {retry_after}s. Attempt {attempt + 1}/{MAX_RETRIES}"
+                        f"Rate limited (429). Retry-After: {retry_after}s. "
+                        f"Attempt {attempt + 1}/{MAX_RETRIES}"
                     )
                     time.sleep(retry_after)
                     continue
@@ -151,10 +157,10 @@ def _fetch_audit_logs(token: str, start_timestamp: str | None = None) -> list[di
                 next_cursor = data.get("next_cursor")
 
                 logging.info(
-                    f"Fetched {len(events)} events (total: {len(all_events)}, has_more: {has_more})"
+                    f"Fetched {len(events)} events "
+                    f"(total: {len(all_events)}, has_more: {has_more})"
                 )
 
-                # Rate limit: sleep between requests
                 time.sleep(RATE_LIMIT_SLEEP)
                 break
 
@@ -183,7 +189,9 @@ def _transform_events(events: list[dict]) -> list[dict]:
         target = event.get("target", {})
 
         record = {
-            "TimeGenerated": event.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            "TimeGenerated": event.get(
+                "timestamp", datetime.now(timezone.utc).isoformat()
+            ),
             "EventId": event.get("id", ""),
             "WorkspaceId_Notion": event.get("workspace_id", ""),
             "ActorType": actor.get("type", ""),
@@ -213,7 +221,6 @@ def _send_to_log_analytics(
         return
 
     client = LogsIngestionClient(endpoint=DCE_ENDPOINT, credential=credential)
-    # SDK handles automatic batching (max 1MB per request), retries, and auth
     client.upload(rule_id=DCR_IMMUTABLE_ID, stream_name=DCR_STREAM_NAME, logs=events)
     logging.info(f"Successfully sent {len(events)} events to Log Analytics.")
 
@@ -233,21 +240,25 @@ def notion_audit_log_timer(timer: func.TimerRequest) -> None:
     try:
         credential = DefaultAzureCredential()
 
-        # 1. Get Notion token
-        token = _get_notion_token(credential)
+        # 1. Get Notion token (injected via Key Vault Reference)
+        token = _get_notion_token()
 
-        # 2. Get last poll timestamp
+        # 2. Get last poll timestamp from Blob Storage (MI auth)
         state_manager = None
         last_timestamp = None
         if STATE_STORAGE_ACCOUNT_NAME:
             state_manager = StateManager(
-                STATE_STORAGE_ACCOUNT_NAME, STATE_CONTAINER_NAME, STATE_BLOB_NAME,
+                STATE_STORAGE_ACCOUNT_NAME,
+                STATE_CONTAINER_NAME,
+                STATE_BLOB_NAME,
                 credential=credential,
             )
             last_timestamp = state_manager.get_last_timestamp()
-            logging.info(f"Last poll timestamp: {last_timestamp or 'None (first run)'}")
+            logging.info(
+                f"Last poll timestamp: {last_timestamp or 'None (first run)'}"
+            )
 
-        # 3. Fetch audit logs
+        # 3. Fetch audit logs from Notion API
         events = _fetch_audit_logs(token, start_timestamp=last_timestamp)
         logging.info(f"Fetched {len(events)} events from Notion API.")
 
@@ -255,13 +266,13 @@ def notion_audit_log_timer(timer: func.TimerRequest) -> None:
             logging.info("No new events. Exiting.")
             return
 
-        # 4. Transform events
+        # 4. Transform events to Log Analytics schema
         transformed = _transform_events(events)
 
-        # 5. Send to Log Analytics
+        # 5. Send to Log Analytics via Logs Ingestion API (MI auth)
         _send_to_log_analytics(credential, transformed)
 
-        # 6. Update state
+        # 6. Update state with newest timestamp
         if state_manager and events:
             newest_timestamp = events[0].get("timestamp", "")
             if newest_timestamp:

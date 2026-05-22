@@ -2,21 +2,25 @@
 
 Notion の [Audit Log API](https://developers.notion.com/reference/get-audit-log) から監査ログを自動取得し、Microsoft Sentinel の `NotionAuditLog_CL` カスタムテーブルへインジェストする Azure Functions ソリューションです。
 
+**セキュリティ強化版** — Key Vault Reference / Managed Identity / SharedKey 無効化 / Blob パッケージデプロイ
+
 ## アーキテクチャ
 
 ```mermaid
 flowchart LR
-    BS["Blob Storage<br/>State管理"]
-    N["Notion API<br/>(Enterprise Plan)"]
-    F["Azure Functions (Python 3.11)<br/>Timer: 5min | MSI 認証"]
+    KV["Key Vault\n(Token保管)"]
+    BS["Blob Storage\n(State管理)"]
+    N["Notion API\n(Enterprise Plan)"]
+    F["Azure Functions\nTimer: */5 min\nMI 認証"]
     DCE["DCE / DCR"]
-    T[("NotionAuditLog_CL<br/>Microsoft Sentinel")]
+    T[("NotionAuditLog_CL\nMicrosoft Sentinel")]
 
-    BS <-. "State読込/更新" .-> F
-    F -->|"GET /v1/audit_log<br/>差分取得"| N
-    N -->|"JSON Response"| F
-    F -->|"POST バッチ送信<br/>Logs Ingestion API"| DCE
-    DCE -->|"Transform & Ingest"| T
+    KV -. "① KV Ref でToken注入" .-> F
+    BS <-. "② MI認証でState読込/更新" .-> F
+    F -->|"③ GET /v1/audit_log\n差分取得"| N
+    N -->|"④ JSON Response\n(100件/page)"| F
+    F -->|"⑤ MI認証で\nバッチ送信"| DCE
+    DCE -->|"⑥ Transform & Ingest"| T
 ```
 
 ## 特徴
@@ -24,11 +28,13 @@ flowchart LR
 | 特徴 | 詳細 |
 |---|---|
 | **差分取得** | Blob Storage に前回ポーリング時刻を保持し、`start_date` パラメータで差分のみ取得 |
-| **App Settings 直接格納** | Notion Token は `@secure()` Bicep パラメータ経由で App Settings に安全に格納。Key Vault 不要 |
-| **Identity-based Storage** | Blob Storage は MSI + RBAC。Shared Key 不使用でポリシー準拠 |
+| **Key Vault Reference** | Notion Token は Key Vault に格納。`@Microsoft.KeyVault(...)` 形式で環境変数に自動注入 |
+| **SharedKey 無効化** | Storage Account の SharedKey を完全無効化。全アクセスを MI + RBAC で制御 |
+| **Identity-based Storage** | `AzureWebJobsStorage__accountName` 形式で MI ベース接続 |
+| **Blob パッケージデプロイ** | `WEBSITE_RUN_FROM_PACKAGE` + MI 認証で zip をマウント |
 | **SDK バッチ送信** | `LogsIngestionClient` による自動バッチング (max 1MB/req) とリトライ |
-| **レートリミット対応** | 429 時の指数バックオフ |
-| **低コスト** | Consumption Y1 プランで月額 **$3〜$10** |
+| **レートリミット対応** | 429 時の指数バックオフ (3回リトライ) |
+| **低コスト** | Consumption Y1 プランで月額 **$1〜$5** |
 
 ## 前提条件
 
@@ -39,26 +45,21 @@ flowchart LR
 
 ### Azure
 
-- Azure サブスクリプション（Contributor + User Access Administrator / Owner）
+- Azure サブスクリプション（Owner または Contributor + User Access Administrator）
 - Sentinel が有効化された Log Analytics ワークスペース
 - Azure CLI v2.60 以上
-- Python 3.11
-
-> **⚠ Azure Policy に関する注意**: 以下のポリシーが適用されている環境ではデプロイが失敗する場合があります。
-> - **Storage Account `publicNetworkAccess: Disabled` を強制するポリシー**: Bicep デプロイ時に Storage Account の作成が拒否されます。該当する場合は、`deploy.bicep` に `publicNetworkAccess: 'Enabled'` を追加するか、Private Endpoint の構成が必要です。
-> - **Storage Account llowSharedKeyAccess: false を強制するポリシー**: `AzureWebJobsStorage` 接続が Shared Key を使用するため、Function App が起動しません。`deploy.ps1` は自動検出して方法 B（Blob パッケージデプロイ）に切り替えますが、`AzureWebJobsStorage` 自体の接続方式は変更されません。対処法: [Identity-based connections](https://learn.microsoft.com/azure/azure-functions/functions-reference?tabs=blob#connecting-to-host-storage-with-an-identity) を構成するか、ポリシーの除外設定をリクエストしてください。
+- Python 3.9 以上（ローカルビルド用。ランタイムは 3.11）
 
 ## ファイル構成
 
 ```
-├── params.json                          # パラメータテンプレート（最初にこれを編集）
-├── deploy.ps1                           # ワンクリック展開スクリプト
-├── deploy.bicep                 # インフラ一括デプロイ（Func + Storage + AI + DCE/DCR + RBAC）
-├── build_and_deploy.py          # 方法 B 用 zip ビルド & デプロイ自動化
+├── README.md                    # 本ファイル
+├── deploy.bicep                 # インフラ一括デプロイ（Func + Storage + KV + AI + DCE/DCR + RBAC）
+├── build_and_deploy.py          # zip ビルド & Blob デプロイ自動化スクリプト
 └── function_app/
-    ├── function_app.py                  # Timer Trigger: Notion API → スキーマ変換 → Logs Ingestion API
-    ├── requirements.txt                 # Python 依存パッケージ
-    └── host.json                        # Functions ランタイム設定
+    ├── function_app.py          # Timer Trigger: Notion API → スキーマ変換 → Logs Ingestion API
+    ├── requirements.txt         # Python 依存パッケージ
+    └── host.json                # Functions ランタイム設定
 ```
 
 ## デプロイされるリソース
@@ -71,126 +72,86 @@ Bicep により以下のリソースが一括デプロイされます。
 | 2 | App Service Plan (Dynamic Y1) | `{baseName}-plan-{suffix}` | Consumption 課金プラン |
 | 3 | Storage Account | `st{baseName}{suffix}` | Functions バックエンド + State Blob |
 | 4 | Application Insights | `{baseName}-ai-{suffix}` | 実行ログ・メトリクス監視 |
-| 5 | DCE | `{baseName}-dce-{suffix}` | ログ受信エンドポイント |
-| 6 | DCR | `{baseName}-dcr-{suffix}` | スキーマ定義・ルーティング |
-
-> **Notion Token**: `@secure()` Bicep パラメータとして渡され、Function App の App Settings (`NOTION_TOKEN_DIRECT`) に直接格納されます。Key Vault は使用しません。
+| 5 | Key Vault | `kv-{baseName}-{suffix}` | Notion Token 格納 |
+| 6 | DCE | `{baseName}-dce-{suffix}` | ログ受信エンドポイント |
+| 7 | DCR | `{baseName}-dcr-{suffix}` | スキーマ定義・ルーティング |
 
 RBAC は Bicep 内で自動割り当て:
-- **Storage Blob Data Contributor** → Function App MSI
-- **Monitoring Metrics Publisher** → Function App MSI (DCR スコープ)
+- **Key Vault Secrets User** → Function App MI（Token 読み取り）
+- **Storage Blob Data Owner** → Function App MI（State Blob + ランタイム）
+- **Storage Queue Data Contributor** → Function App MI（ランタイム）
+- **Storage Table Data Contributor** → Function App MI（ランタイム）
+- **Monitoring Metrics Publisher** → Function App MI（DCR スコープ）
 
 ## クイックスタート
 
-### 1. パラメータファイルの編集
+### Step 1: Bicep でインフラをデプロイ
 
-`params.json` を開き、環境情報を記入します。
+```bash
+# リソースグループ作成
+az group create --name <RG_NAME> --location <REGION>
 
-```json
-{
-  "azure": {
-    "subscriptionId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    "resourceGroupName": "Notion-Audit-Func-RG",
-    "location": "japaneast"
-  },
-  "sentinel": {
-    "workspaceResourceId": "/subscriptions/xxx/.../workspaces/xxx"
-  },
-  "notion": {
-    "integrationToken": "secret_XXXXXXXXXXXX..."
-  },
-  "options": {
-    "baseName": "notion-audit",
-    "pollingIntervalMinutes": 5
-  }
-}
+# Bicep デプロイ
+az deployment group create \
+  --resource-group <RG_NAME> \
+  --template-file deploy.bicep \
+  --parameters sentinelWorkspaceResourceId="<WORKSPACE_RESOURCE_ID>"
 ```
 
-> **リージョン制約**: DCE/DCR は Log Analytics ワークスペースと**同じリージョン**に配置する必要があります。`location` を Sentinel ワークスペースと同じリージョンに設定してください。
+> **⚠ リージョン**: Consumption Plan のクォータがないリージョンではデプロイが失敗します。`japaneast` で `SkuNotAvailable` エラーが出る場合は `switzerlandnorth` 等を試してください。
 
-### 2. 自動デプロイの実行
+### Step 2: Notion Integration Token を Key Vault に格納
 
-```powershell
-az login
-az account set --subscription "<SUB_ID>"
-.\deploy.ps1
+```bash
+# デプロイ出力から Key Vault 名を取得
+KV_NAME=$(az deployment group show \
+  --resource-group <RG_NAME> --name deploy \
+  --query properties.outputs.keyVaultName.value -o tsv)
+
+# Token を格納
+az keyvault secret set \
+  --vault-name $KV_NAME \
+  --name NotionIntegrationToken \
+  --value "<NOTION_INTEGRATION_TOKEN>"
 ```
 
-スクリプトが以下を自動実行します:
+### Step 3: Function App コードをデプロイ
 
-| Step | 内容 |
-|---|---|
-| 0 | Azure CLI ログイン確認 |
-| 1 | リソースグループ作成 |
-| 2 | Bicep デプロイ (全インフラ + Notion Token を App Settings に格納) |
-| 3 | Function App コードデプロイ |
-| 4 | 動作確認 |
+```bash
+# デプロイ出力からリソース名を取得
+FUNC_NAME=$(az deployment group show \
+  --resource-group <RG_NAME> --name deploy \
+  --query properties.outputs.functionAppName.value -o tsv)
+STORAGE_NAME=$(az deployment group show \
+  --resource-group <RG_NAME> --name deploy \
+  --query properties.outputs.storageAccountName.value -o tsv)
 
-> `deploy.ps1` はデプロイ後に Storage Account の `allowSharedKeyAccess` プロパティを自動検出し、`false` の場合は方法 A (`func publish`) → 方法 B (Blob パッケージデプロイ) に自動切替します。
-
-### 3. Notion Integration Token の作成
-
-1. [https://www.notion.so/my-integrations](https://www.notion.so/my-integrations) にアクセス
-2. 「+ New integration」→ Integration name を入力
-3. Associated workspace を選択 → Submit
-4. **Capabilities** タブ → 「**Read audit logs**」にチェック → Save changes
-5. **Secrets** タブ → Token をコピー
-
-> ⚠ Token は一度しか完全に表示されません。
-
-## 手動デプロイ
-
-自動デプロイを使わない場合、各ステップを個別に実行できます。
-
-### リソースグループ作成 & Bicep デプロイ
-
-```powershell
-az group create --name Notion-Audit-Func-RG --location japaneast
-
-az deployment group create `
-  --resource-group Notion-Audit-Func-RG `
-  --template-file deploy.bicep `
-  --parameters `
-    sentinelWorkspaceResourceId="<WORKSPACE_RESOURCE_ID>" `
-    notionToken="<NOTION_INTEGRATION_TOKEN>"
+# 自動化スクリプトで Blob デプロイ
+python build_and_deploy.py \
+  --resource-group <RG_NAME> \
+  --function-app $FUNC_NAME \
+  --storage-account $STORAGE_NAME \
+  --blob-name release-$(date +%Y%m%d%H%M%S).zip
 ```
 
-> `notionToken` は `@secure()` パラメータです。Bicep が Function App の App Settings (`NOTION_TOKEN_DIRECT`) に直接格納します。
+> **前提**: デプロイ実行ユーザーが Storage Account に対し **Storage Blob Data Contributor** 以上の RBAC を持っている必要があります（`--auth-mode login` でアップロードするため）。
 
-### コードデプロイ — 方法 A (標準環境)
+### Step 4: 動作確認
 
-```powershell
-cd function_app
-func azure functionapp publish <FUNCTION_APP_NAME> --build remote
+```bash
+# 手動トリガー
+MASTER_KEY=$(az functionapp keys list \
+  --name $FUNC_NAME --resource-group <RG_NAME> \
+  --query masterKey -o tsv)
+
+curl -X POST \
+  "https://$FUNC_NAME.azurewebsites.net/admin/functions/notion_audit_log_timer" \
+  -H "x-functions-key: $MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
-> `--build remote` により Azure 側で依存パッケージが自動インストールされます。ローカルでの `pip install --target` は不要です。
-
-### コードデプロイ — 方法 B (allowSharedKeyAccess: false 環境)
-
-`build_and_deploy.py` を使うか、以下の手順で zip パッケージをデプロイします:
-
-1. Linux x86_64 クロスビルドで zip を作成 (`--platform manylinux2014_x86_64`)
-2. Blob Storage にアップロード (`az storage blob upload --auth-mode login`)
-3. App Settings で `WEBSITE_RUN_FROM_PACKAGE` を Blob URL に設定
-4. Function App を再起動
-
-## 動作確認
-
-### 手動トリガー
-
-```powershell
-$masterKey = az functionapp keys list `
-  --name <FUNCTION_APP_NAME> `
-  --resource-group Notion-Audit-Func-RG `
-  --query masterKey -o tsv
-
-Invoke-RestMethod `
-  -Uri "https://<FUNCTION_APP_NAME>.azurewebsites.net/admin/functions/notion_audit_log_timer" `
-  -Method Post `
-  -Headers @{ "x-functions-key" = $masterKey; "Content-Type" = "application/json" } `
-  -Body '{}'
-```
+期待されるレスポンス: **HTTP 202 (Accepted)**
 
 ### KQL でデータ到達確認
 
@@ -201,34 +162,97 @@ NotionAuditLog_CL
 | order by Count desc
 ```
 
+## デプロイ方法の詳細
+
+本ソリューションは **Blob パッケージデプロイのみ** をサポートします。
+
+> **理由**: `allowSharedKeyAccess: false` を設定するため、SharedKey を使用する `func publish` は利用できません。
+
+### `build_and_deploy.py` の動作
+
+| Step | 処理内容 |
+|---|---|
+| 1 | `pip install` で Linux Python 3.11 向けパッケージをダウンロード |
+| 2 | `.python_packages/lib/site-packages/` 配下に配置して zip 作成 |
+| 3 | `az storage blob upload --auth-mode login` で Blob にアップロード |
+| 4 | `WEBSITE_RUN_FROM_PACKAGE` を Blob URL に設定 |
+| 5 | Function App を再起動 |
+
+### ビルドの仕組み
+
+ローカル環境の Python バージョン・OS に関わらず、以下のオプションで Azure Functions ランタイム (Linux Python 3.11) 互換のパッケージを取得します:
+
+```
+pip install --platform manylinux2014_x86_64 --python-version 3.11 --only-binary=:all:
+```
+
+### パラメータ
+
+```bash
+python build_and_deploy.py \
+  --resource-group <RG_NAME> \          # リソースグループ名
+  --function-app <FUNCTION_APP_NAME> \  # Function App 名
+  --storage-account <STORAGE_ACCOUNT> \ # Storage Account 名
+  --blob-name <BLOB_NAME> \             # zip ファイル名（デフォルト: release.zip）
+  --container <CONTAINER> \             # Blob コンテナ名（デフォルト: function-releases）
+  --function-app-dir <DIR>              # ソースディレクトリ（デフォルト: ./function_app）
+```
+
+> **推奨**: `--blob-name` にタイムスタンプ付きの名前を指定してください（例: `release-20260522.zip`）。同名 blob を上書きすると、ランタイムのキャッシュにより古いコードが使われ続ける場合があります。
+
 ## トラブルシューティング
 
 | 症状 | 原因 | 対処 |
 |---|---|---|
-| `func publish` が 403 | `allowSharedKeyAccess: false` ポリシー | 方法 B (Blob デプロイ) を使用 |
-| 関数が 0 件 | `EnableWorkerIndexing` 未設定 | App Settings で `AzureWebJobsFeatureFlags=EnableWorkerIndexing` を確認 |
-| 関数が起動するが import エラー | zip に Windows バイナリ (.pyd) が混入 | `--platform manylinux2014_x86_64` で zip を再作成 |
-| Notion API 401 | Token 無効/期限切れ | Azure Portal → Function App → 構成 → `NOTION_TOKEN_DIRECT` を確認・更新 |
+| Bicep デプロイで `SkuNotAvailable` | リージョンに Consumption Plan クォータなし | 別リージョン（`switzerlandnorth` 等）を使用 |
+| `func publish` が 403 | `allowSharedKeyAccess: false` (設計上の仕様) | `build_and_deploy.py` を使用 |
+| Blob アップロードで 403 | デプロイユーザーに Storage RBAC なし | Storage Blob Data Contributor を割り当て |
+| 関数が 0 件 (`function list` が空) | CLI キャッシュの問題 | Admin API (`/admin/functions`) で直接確認 |
+| Python ImportError (cryptography) | Windows/他バージョンでビルドされた zip | `--platform manylinux2014_x86_64` で再ビルド |
+| パッケージが見つからない (ModuleNotFoundError) | zip 内パス不正 | `.python_packages/lib/site-packages/` 配下に配置 |
+| Key Vault Reference が `Unauthorized` | MI に KV Secrets User なし | RBAC 割り当てを確認 |
+| Key Vault Reference が `VaultNotFound` | KV FW が Deny (Consumption Plan 非対応) | `defaultAction: Allow` に変更 |
+| Notion API 401 | Token 無効/期限切れ | KV から Token 取得して直接テスト |
 | Notion API 403 | Enterprise プラン以外 | Notion 管理画面でプラン確認 |
-| データが来ない | DCR RBAC 不足 or インジェスト遅延 | Monitoring Metrics Publisher RBAC を確認。5〜10 分待つ |
+| データが来ない | DCR RBAC 不足 or インジェスト遅延 | Monitoring Metrics Publisher を確認。5〜10 分待つ |
+
+### Key Vault Firewall と Consumption Plan
+
+Azure Functions Consumption Plan では、Key Vault の Firewall を `defaultAction: Deny` にすると Key Vault Reference が解決できません。これは Consumption Plan のアウトバウンド IP が動的で予測不可能なためです。
+
+**対処**: Key Vault FW は `defaultAction: Allow` としつつ、RBAC でアクセス制御を担保します。Premium Plan / VNet 統合を使用する場合は `defaultAction: Deny` + Private Endpoint が可能です。
+
+## セキュリティ設計
+
+| 項目 | 設定 |
+|---|---|
+| **Token 管理** | Key Vault Reference（App Settings に直接格納しない） |
+| **Storage 認証** | MI 認証のみ（SharedKey 完全無効化） |
+| **Key Vault FW** | `defaultAction: Allow`（Consumption Plan 制限。RBAC で保護） |
+| **Function FW** | Access Restrictions: AzureCloud のみ許可 |
+| **デプロイ** | Blob パッケージデプロイ（MI 認証で zip 読み込み） |
+| **RBAC** | 最小権限の原則（各リソースに必要最小限のロールのみ割り当て） |
 
 ## コスト目安
 
 | リソース | SKU | 月額目安 |
 |---|---|---|
 | Function App | Consumption Y1 | $0〜$5 |
-| Storage Account | Standard LRS | $1〜$2 |
-| Application Insights | 従量課金 | $2〜$5 |
+| Storage Account | Standard LRS | ~$0.01 |
+| Key Vault | Standard | ~$0.03 |
+| Application Insights | 従量課金 | $0.50〜$2 |
 | DCE / DCR | — | 無料 |
-| **合計** | | **$3〜$10/月** |
+| **合計** | | **$1〜$5/月** |
 
 > Log Analytics へのデータインジェスト課金 ($2.76/GB) は含まれていません。Notion Audit Log は軽量 (1件 ~500B) のため、月10万件でも ~50MB (~$0.14) 程度です。
 
 ## アンインストール
 
-```powershell
-az group delete --name Notion-Audit-Func-RG --yes --no-wait
+```bash
+az group delete --name <RG_NAME> --yes --no-wait
 ```
+
+> Log Analytics ワークスペース内の `NotionAuditLog_CL` テーブルは、リソースグループ削除では消えません（ワークスペースが別 RG にある場合）。
 
 ## Notion Audit Log API 仕様準拠
 
@@ -237,7 +261,7 @@ az group delete --name Notion-Audit-Func-RG --yes --no-wait
 | エンドポイント | `GET /v1/audit_log` | ✓ |
 | 認証方式 | `Authorization: Bearer {token}` | ✓ |
 | API バージョン | `Notion-Version: 2022-06-28` | ✓ |
-| ページネーション | カーソルベース | ✓ |
+| ページネーション | カーソルベース (`next_cursor`) | ✓ |
 | レートリミット | 3 req/sec, 429 + Retry-After | ✓ (指数バックオフ) |
 | イベントカテゴリ | 5 カテゴリ | ✓ |
 | 差分取得 | `start_date` パラメータ | ✓ (State Blob で自動管理) |
