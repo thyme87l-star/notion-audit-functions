@@ -1,10 +1,10 @@
-// ISS-065-05 Notion Audit Log Connector — Azure Functions Deployment (Security Hardened)
+// Notion Audit Log Connector — Azure Functions Deployment (Security Hardened)
 // =======================================================================================
-// セキュリティ設計（2026-05-22 承認済み）を完全反映:
+// セキュリティ設計:
 //   - Key Vault Reference による Token 管理
 //   - System Assigned MI による全リソースアクセス
 //   - Storage SharedKey 無効化 + MI 認証
-//   - Key Vault FW: Deny + AzureServices bypass
+//   - Key Vault FW: Allow + RBAC 保護 (Consumption Plan 制限)
 //   - Function Access Restrictions: AzureCloud のみ許可
 //   - Blob パッケージデプロイ対応
 //   - RBAC: KV Secrets User / Storage Blob Data Owner / Queue Contributor / Table Contributor / Metrics Publisher
@@ -27,15 +27,12 @@ param sentinelWorkspaceResourceId string
 @description('Polling interval in minutes')
 param pollingIntervalMinutes int = 5
 
-@description('Management ID tag')
-param mgmtId string = 'ISS-065'
+@description('Optional tag value for resource tracking')
+param tagValue string = ''
 
 // Common tags
 var tags = {
-  MgmtID: mgmtId
-  Project: '課題ベース対応'
   Purpose: 'Notion Audit Log Sentinel Ingestion'
-  CreatedBy: 'Orchestrator'
 }
 
 var uniqueSuffix = uniqueString(resourceGroup().id, baseName)

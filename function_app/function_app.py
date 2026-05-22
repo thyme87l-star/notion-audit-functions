@@ -1,8 +1,6 @@
 """
 Notion Audit Log Connector — Azure Functions (Timer Trigger)
 =====================================================================
-ISS-065-05: セキュリティ設計適用版
-
 Notion Audit Log API からイベントを定期取得し、Logs Ingestion API 経由で
 Log Analytics カスタムテーブル (NotionAuditLog_CL) に送信する。
 

@@ -1,5 +1,5 @@
 """
-ISS-065-05: Blob Package Deploy Script
+Blob Package Deploy Script
 ========================================
 SharedKey 無効化環境向けの Function App デプロイスクリプト。
 zip パッケージを作成し、MI 認証で Blob にアップロード後、
