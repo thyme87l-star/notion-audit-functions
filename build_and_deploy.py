@@ -146,7 +146,7 @@ def restart_function_app(resource_group: str, function_app: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ISS-065-05 Blob Package Deploy")
+    parser = argparse.ArgumentParser(description="Blob Package Deploy for SharedKey-disabled environments")
     parser.add_argument("--resource-group", "-g", required=True, help="Resource group name")
     parser.add_argument("--function-app", "-f", required=True, help="Function App name")
     parser.add_argument("--storage-account", "-s", required=True, help="Storage account name")
@@ -167,7 +167,7 @@ def main():
     output_zip = function_app_dir / "release.zip"
 
     print("=" * 60)
-    print("ISS-065-05: Blob Package Deploy")
+    print("Blob Package Deploy (SharedKey-disabled)")
     print("=" * 60)
     print(f"  Resource Group:  {args.resource_group}")
     print(f"  Function App:    {args.function_app}")
